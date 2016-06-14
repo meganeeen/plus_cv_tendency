@@ -1,0 +1,131 @@
+---
+title: "plus_cv_tendency"
+output: html_document
+---
+
+```{r plus_cv_tendency}
+# rm(list=ls())
+# options(error=recover)
+### 前処理
+file_names <- list.files("./input_folder/", pattern="csv")
+n <- length(file_names)
+
+select_colname_vector <- c("ユーザーID", "セッションID", "アクセス日時", "URL", "訪問開始からのページ数", "内部、検索流入の参照元URL", "外部の参照元URL", "広告の種類", "広告の媒体", "広告キャンペーンID", "グループ1", "グループ2", "グループ3", "グループ4")
+
+rename_colname_vector <- c("user_id", "session_id", "access_time", "url", "hit_number_in_session", "inner_referral_url", "outer_referral_url", "params_media", "params_source", "params_campagin", "group_one", "group_two", "group_three", "group_four")
+
+access_log_atomic_tbl <- fread(paste("./input_folder/", file_names[[1]], sep=""), sep=",", header=T, encoding="UTF-8", stringsAsFactors=F, select=select_colname_vector, integer64="numeric", na.strings=c("NA", "")) 
+
+for(i in 2:n){
+  temp_monthly_log_tbl <- fread(paste("./input_folder/", file_names[[i]], sep=""), sep=",", header=T, encoding="UTF-8", stringsAsFactors=F, select=select_colname_vector, integer64="numeric", na.strings=c("NA", "")) 
+  access_log_atomic_tbl <- rbind(access_log_atomic_tbl, temp_monthly_log_tbl, use.names=FALSE, idcol=NULL)
+}
+
+# 「、」が処理中で文字化けを起こし、エラーを出すため個別処理。
+names(access_log_atomic_tbl)[7] <- "inner_referral_url"
+
+select_colname_vector <- select_colname_vector[-6]
+rename_colname_vector_pickout <- rename_colname_vector[-6]
+
+access_log_atomic_tbl <- access_log_atomic_tbl %>% rename_(.dots = setNames(
+  select_colname_vector, rename_colname_vector_pickout))
+# 並び替え
+access_log_atomic_tbl <- access_log_atomic_tbl %>% select_(.dots = rename_colname_vector)
+
+### 分析処理
+access_log_atomic_tbl <- access_log_atomic_tbl %>% mutate(utm_params=ifelse(!is.na(params_media) & !is.na(params_source), paste(params_media, params_source, sep="_"), NA), cv_type=group_two) %>% select(-c(params_media, params_source, params_campagin, group_one, group_two, group_three, group_four))
+
+access_log_atomic_tbl <- access_log_atomic_tbl %>% mutate(outer_referral=ifelse(!is.na(utm_params), utm_params, outer_referral_url))
+
+# outer_referralパターン把握用
+# access_log_atomic_tbl %>% mutate(outer_referral=ifelse(!is.na(utm_params), utm_params, outer_referral_url)) %>% group_by(outer_referral, utm_params, outer_referral_url) %>% summarise(pattern_n=n()) %>% ungroup() %>% arrange(desc(pattern_n)) %>% View()
+
+# outer_referralの表記揺れを制御
+before_forms_vector <- c("facebook.com", "mail", "cxpublic", "reader", "auone", "t.co", "newspicks", "icloud", "tk-dcl", "msn", "stacknews.net", "cybozu")
+after_forms_vector <- c("social_facebook", "mail_magazine", "other_cxense", "other_rss", "http_auone", "social_Twitter", "http_newspicks", "other_icloud", "owned_dcl", "http_msn", "other_stacknews", "other_cybozu")
+
+diff_forms_vector <- data.frame(before=before_forms_vector, after=after_forms_vector, stringsAsFactors=F)
+
+m <- nrow(diff_forms_vector)
+
+for(i in 1:m){
+  access_log_atomic_tbl[str_detect(access_log_atomic_tbl$outer_referral, diff_forms_vector$before[i]), ]$outer_referral <- diff_forms_vector$after[i]  
+}
+
+access_log_atomic_tbl[str_detect(access_log_atomic_tbl$inner_referral_url, "www.google.co.jp"), ]$outer_referral <- "organic"
+access_log_atomic_tbl[str_detect(access_log_atomic_tbl$inner_referral_url, "search.yahoo.co.jp"), ]$outer_referral <- "organic"
+
+access_log_atomic_tbl[is.na(access_log_atomic_tbl$outer_referral), ]$outer_referral <- "no_referrer"
+
+access_log_atomic_tbl$access_time <- as.POSIXct(access_log_atomic_tbl$access_time, origin="1970-01-01", tz="Asia/Tokyo")
+
+# access_log_atomic_tbl %>% filter(hit_number_in_session==1 | !is.na(cv_type)) %>% group_by(user_id) %>% arrange(access_time) %>% select(user_id, session_id, access_time, inner_referral_url, outer_referral, cv_type) %>% View()
+
+session_master_tbl <- access_log_atomic_tbl %>% filter(hit_number_in_session==1 | (!is.na(utm_params) & utm_params!="owned_media_plus") | !is.na(cv_type)) %>% group_by(user_id) %>% arrange(access_time) %>% select(user_id, session_id, access_time, url, hit_number_in_session, inner_referral_url, outer_referral, utm_params, cv_type)
+
+# セッション開始時の参照元が、内部urlだけのセッションを除く。
+#outer_referral_session_tbl <- session_master_tbl %>% filter(outer_referral!="no_referrer" | (is.na(inner_referral_url) & outer_referral=="no_referrer"))
+
+outer_referral_session_tbl <- session_master_tbl
+
+cv_session_tbl <- session_master_tbl %>% filter(cv_type=="SYUKAN_TOYOKEIZAI")
+cv_total <- nrow(cv_session_tbl)
+
+access_log_atomic_tbl <- access_log_atomic_tbl %>% 
+  mutate(inner_domain=str_extract(url, "^http(|s)\\:\\/\\/([:lower:]|\\.)+"))
+
+cv_referral_tbl <- data.frame()
+
+A %._.% for(cv_i in 1:cv_total){
+  cv_row <- cv_session_tbl[cv_i, ]
+  
+  cv_referral_temp_tbl <- outer_referral_session_tbl %>% filter(user_id==cv_row$user_id, access_time < cv_row$access_time) %>% filter(access_time == max(access_time)) %>% select(user_id, session_id, outer_referral, url, hit_number_in_session, access_time) %>% mutate(cv_time=cv_row$access_time)
+  
+  if(cv_referral_temp_tbl$outer_referral == "no_referrer" | 
+     cv_referral_temp_tbl$outer_referral == "owned_media_plus"){
+    
+    pre_cv_sessions_tbl <- outer_referral_session_tbl %>% filter(user_id==cv_row$user_id, access_time<=cv_row$access_time) %>% arrange(desc(access_time))
+    s_total <- nrow(pre_cv_sessions_tbl)
+    B %._.% for(s_i in 1:s_total){
+      s_row <- pre_cv_sessions_tbl[s_i, ]
+      if(s_row$outer_referral != "no_referrer" & s_row$outer_referral != "owned_media_plus"){
+        cv_referral_temp_tbl <- data.frame(
+          user_id=s_row$user_id, session_id=s_row$session_id, 
+          outer_referral=s_row$outer_referral, url=s_row$url, hit_number_in_session=s_row$hit_number_in_session, access_time=s_row$access_time, 
+          cv_time=cv_row$access_time, stringsAsFactors=FALSE)
+        ._.(B)
+      }
+    }
+  }
+  cv_referral_tbl <- rbind(cv_referral_tbl, cv_referral_temp_tbl, use.names=FALSE, idcol=NULL) 
+}
+
+cv_id_time_tbl <- cv_referral_tbl %>% select(user_id, cv_time) 
+
+access_log_atomic_tbl <- left_join(access_log_atomic_tbl, cv_id_time_tbl)
+
+cv_totall <- nrow(cv_referral_tbl)
+paths_in_cv_session_tbl <- data.frame()
+for(cv_ii in 1:cv_totall){
+  cv_roww <- cv_referral_tbl[cv_ii,]
+  
+  paths_in_cv_session_temp_tbl <- access_log_atomic_tbl %>% filter(user_id==cv_roww$user_id, cv_time==cv_roww$cv_time) %>% filter((cv_roww$access_time <= access_time) & (access_time <= cv_roww$cv_time))
+  
+  paths_in_cv_session_tbl <- rbind(paths_in_cv_session_tbl, paths_in_cv_session_temp_tbl, use.names=FALSE, idcol=NULL)
+}
+
+paths_in_cv_session_tbl %>% group_by(user_id) %>% filter(inner_domain!="https://s.toyokeizai.net" | !duplicated(url)) %>% ungroup() %>% group_by(url) %>% summarise(url_n=n())
+
+# cv_user_referrer_tbl <- data.frame(matrix(unlist(cv_session_list), nrow=p, byrow=T)) %>% 
+#  rename(user_id=X1, referrer=X2, cv_time=X3) %>% group_by(referrer) %>% summarise(referer_n=n())
+
+write.csv(cv_referral_tbl, "./cv_referral_tbl.csv", row.names=FALSE)
+```
+
+```{r memo}
+access_log_atomic_tbl[str_detect(access_log_atomic_tbl$outer_referral, "social"), ]
+
+
+```
+
+
